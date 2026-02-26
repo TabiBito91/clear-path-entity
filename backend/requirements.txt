@@ -2,6 +2,7 @@ fastapi==0.115.6
 uvicorn[standard]==0.32.1
 sqlalchemy[asyncio]==2.0.36
 aiosqlite==0.20.0
+asyncpg==0.30.0
 playwright==1.49.1
 anthropic==0.40.0
 httpx==0.28.1

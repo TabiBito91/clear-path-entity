@@ -29,7 +29,7 @@ app = FastAPI(title="Clear Path Entity", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=list({settings.frontend_url, "http://localhost:3000"}),
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -144,8 +144,8 @@ function MatchRow({
             </div>
           ) : detail ? (
             <div className="mt-2 space-y-1 text-xs text-neutral-600">
-              {detail.error && (
-                <p className="text-red-500">{detail.error}</p>
+              {detail.error && !detail.formation_date && !detail.entity_kind && !detail.registered_agent && (
+                <p className="text-neutral-400">Details available on OpenCorporates.</p>
               )}
               {detail.formation_date && (
                 <p><span className="text-neutral-400">Formed:</span> {detail.formation_date}</p>

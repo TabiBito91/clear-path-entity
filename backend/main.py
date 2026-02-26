@@ -12,6 +12,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from adapters.detail.opencorporates import fetch_entity_detail
 from agents.orchestrator import run_search
+from config import settings
 from database import AsyncSessionLocal, get_db, init_db
 from models import EntityDetailCache, Job, StateResult, UsptoResult
 

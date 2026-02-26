@@ -35,7 +35,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SUPPORTED_STATES = ["DE"]  # expand as adapters are added
+SUPPORTED_STATES = ["DE", "NY"]  # expand as adapters are added
 
 ENTITY_TYPES = ["LLC", "Corporation", "LP", "LLP", "PC", "PLLC"]
 

@@ -6,6 +6,7 @@ Writes results to the database as they complete so the SSE stream can push them 
 import asyncio
 
 from adapters.states.de import DelawareAdapter
+from adapters.states.ny import NewYorkAdapter
 from agents.uspto import search_uspto
 from database import AsyncSessionLocal
 from llm.client import analyze_similarity
@@ -15,6 +16,7 @@ from rules.engine import apply_rules, get_rules_summary
 # Registry: add new state adapters here as they are built
 STATE_ADAPTERS = {
     "DE": DelawareAdapter,
+    "NY": NewYorkAdapter,
 }
 
 

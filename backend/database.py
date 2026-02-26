@@ -8,6 +8,7 @@ engine = create_async_engine(
     settings.database_url,
     echo=False,
     pool_pre_ping=_is_postgres,
+    connect_args={"statement_cache_size": 0} if _is_postgres else {},
 )
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 

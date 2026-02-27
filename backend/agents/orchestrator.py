@@ -5,6 +5,7 @@ Writes results to the database as they complete so the SSE stream can push them 
 """
 import asyncio
 
+from adapters.states.ca import CaliforniaAdapter
 from adapters.states.de import DelawareAdapter
 from adapters.states.ny import NewYorkAdapter
 from agents.uspto import search_uspto
@@ -15,6 +16,7 @@ from rules.engine import apply_rules, get_rules_summary
 
 # Registry: add new state adapters here as they are built
 STATE_ADAPTERS = {
+    "CA": CaliforniaAdapter,
     "DE": DelawareAdapter,
     "NY": NewYorkAdapter,
 }

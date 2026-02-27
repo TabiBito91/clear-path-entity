@@ -7,6 +7,7 @@ import asyncio
 
 from adapters.states.ca import CaliforniaAdapter
 from adapters.states.de import DelawareAdapter
+from adapters.states.nj import NewJerseyAdapter
 from adapters.states.ny import NewYorkAdapter
 from agents.uspto import search_uspto
 from database import AsyncSessionLocal
@@ -18,6 +19,7 @@ from rules.engine import apply_rules, get_rules_summary
 STATE_ADAPTERS = {
     "CA": CaliforniaAdapter,
     "DE": DelawareAdapter,
+    "NJ": NewJerseyAdapter,
     "NY": NewYorkAdapter,
 }
 

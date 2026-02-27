@@ -132,12 +132,9 @@ def _to_match(row: dict) -> EntityMatch:
 
 
 async def _fetch_two(client, where1: str, where2: str):
-    """Fire two SODA queries concurrently and return both result lists."""
-    import asyncio
-    r1, r2 = await asyncio.gather(
-        client.get(SODA_URL, params={"$where": where1, "$limit": 10}),
-        client.get(SODA_URL, params={"$where": where2, "$limit": 10}),
-    )
+    """Fire two SODA queries sequentially and return both result lists."""
+    r1 = await client.get(SODA_URL, params={"$where": where1, "$limit": 10})
+    r2 = await client.get(SODA_URL, params={"$where": where2, "$limit": 10})
     r1.raise_for_status()
     r2.raise_for_status()
     return r1.json(), r2.json()

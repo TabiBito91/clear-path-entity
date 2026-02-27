@@ -78,16 +78,27 @@ class NewYorkAdapter(BaseStateAdapter):
             )
             page = context.new_page()
             try:
-                page.goto(SEARCH_URL, wait_until="networkidle", timeout=30_000)
+                # Use domcontentloaded then wait explicitly for SPA hydration
+                page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=30_000)
+                # Give the JS SPA time to render the search form
+                page.wait_for_timeout(4_000)
                 return self._fill_and_extract(page, name, entity_type)
             finally:
                 browser.close()
 
     def _fill_and_extract(self, page, name: str, entity_type: str) -> AdapterResult:
-        # Wait for the SPA to render the search form
-        try:
-            page.wait_for_selector("input", timeout=15_000)
-        except PWTimeout:
+        # Wait for the SPA to render — try specific NY DOS elements first,
+        # then fall back to any input
+        rendered = False
+        for selector in ["select", "input[type='text']", "button:has-text('Search')", "input"]:
+            try:
+                page.wait_for_selector(selector, timeout=20_000)
+                rendered = True
+                break
+            except PWTimeout:
+                continue
+
+        if not rendered:
             return AdapterResult(
                 state_code=self.state_code,
                 state_name=self.state_name,

@@ -63,17 +63,31 @@ class DelawareAdapter(BaseStateAdapter):
             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                ],
+            )
             context = browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/120.0.0.0 Safari/537.36"
-                )
+                ),
+                extra_http_headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
             )
             page = context.new_page()
             try:
-                page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=30_000)
+                # "commit" fires as soon as HTTP response headers arrive — much
+                # earlier than "domcontentloaded", which can stall on slow ASPX
+                # servers. 60s accommodates government server latency.
+                page.goto(SEARCH_URL, wait_until="commit", timeout=60_000)
                 return self._fill_and_extract(page, name, entity_type)
             finally:
                 browser.close()

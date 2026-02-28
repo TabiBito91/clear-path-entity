@@ -1,9 +1,11 @@
 """
 Florida Division of Corporations (Sunbiz) — Entity Name Search Adapter
-URL: https://search.sunbiz.org/Inquiry/CorporationSearch/SearchResults
+URL: https://search.sunbiz.org/Inquiry/CorporationSearch/ByName
 
-Server-rendered HTML — no CAPTCHA, no SPA. Search results are fetched by
-navigating directly to the results URL with GET parameters, bypassing the form.
+Navigates to the Sunbiz search form, fills the entity name input, and submits.
+The direct results URL approach was abandoned because Sunbiz requires session
+cookies and a valid referer from the form page before it will return results —
+without them it redirects back to the form, producing no table to parse.
 
 FL returns all entity statuses (Active, INACT, CROSS RF, RPEND/UA, etc.).
 Results table has 3 columns: Corporate Name | Document Number | Status.
@@ -13,13 +15,12 @@ Exact matches against inactive entities are flagged but still returned as "taken
 since name history matters; the user should verify availability with an attorney.
 """
 import asyncio
-import urllib.parse
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 from adapters.base import AdapterResult, BaseStateAdapter, EntityMatch
 
-SEARCH_URL = "https://search.sunbiz.org/Inquiry/CorporationSearch/SearchResults"
+FORM_URL = "https://search.sunbiz.org/Inquiry/CorporationSearch/ByName"
 
 # FL status codes that indicate the entity is no longer active
 _INACTIVE_STATUSES = {
@@ -68,16 +69,12 @@ class FloridaAdapter(BaseStateAdapter):
             )
 
     async def _run(self, name: str, entity_type: str) -> AdapterResult:
-        """Build the search URL and navigate directly — no form-filling needed."""
-        params = {
-            "inquiryType": "EntityName",
-            "inquiryDirective": "StartsWith",
-            "allCurrentNames": "true",
-            "corporationNameSearchTerm": name.strip(),
-            "Search": "Search",
-        }
-        url = f"{SEARCH_URL}?{urllib.parse.urlencode(params)}"
+        """Navigate to the Sunbiz form, fill it, submit, and parse results.
 
+        The direct results URL was abandoned — Sunbiz requires session cookies
+        and a valid Referer set from the form page, otherwise it silently
+        redirects back to the blank form with no results table.
+        """
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
             context = await browser.new_context(
@@ -89,14 +86,71 @@ class FloridaAdapter(BaseStateAdapter):
             )
             page = await context.new_page()
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=10_000)
-                except PWTimeout:
-                    pass
-                return await self._parse_results(page, name, entity_type)
+                await page.goto(FORM_URL, wait_until="domcontentloaded", timeout=30_000)
+                return await self._fill_and_extract(page, name, entity_type)
             finally:
                 await browser.close()
+
+    async def _fill_and_extract(self, page, name: str, entity_type: str) -> AdapterResult:
+        """Fill the Sunbiz search form and submit."""
+        # Name input candidates
+        input_sel = None
+        for sel in [
+            "input[name='corporationNameSearchTerm']",
+            "input#corporationName",
+            "input[placeholder*='name' i]",
+            "input[type='text']",
+        ]:
+            try:
+                await page.wait_for_selector(sel, timeout=8_000)
+                input_sel = sel
+                break
+            except PWTimeout:
+                continue
+
+        if not input_sel:
+            return AdapterResult(
+                state_code=self.state_code,
+                state_name=self.state_name,
+                availability="error",
+                confidence=0.1,
+                notes="FL search form not found — Sunbiz site structure may have changed.",
+                extraction_method="failed",
+            )
+
+        await page.fill(input_sel, name.strip())
+
+        # Submit the form
+        submitted = False
+        for sel in [
+            "input[type='submit']",
+            "button[type='submit']",
+            "input[value='Search']",
+            "button:has-text('Search')",
+        ]:
+            try:
+                await page.click(sel, timeout=5_000)
+                submitted = True
+                break
+            except Exception:
+                continue
+
+        if not submitted:
+            return AdapterResult(
+                state_code=self.state_code,
+                state_name=self.state_name,
+                availability="error",
+                confidence=0.1,
+                notes="FL search submit button not found.",
+                extraction_method="failed",
+            )
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=20_000)
+        except PWTimeout:
+            pass
+
+        return await self._parse_results(page, name, entity_type)
 
     async def _parse_results(self, page, name: str, entity_type: str) -> AdapterResult:
         page_text = (await page.inner_text("body")).lower()

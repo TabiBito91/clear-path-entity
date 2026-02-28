@@ -92,8 +92,10 @@ class WashingtonAdapter(BaseStateAdapter):
             )
             page = await context.new_page()
             try:
-                # Angular SPAs need networkidle to fully hydrate
-                await page.goto(SEARCH_URL, wait_until="networkidle", timeout=30_000)
+                # Use domcontentloaded — Angular SPAs continuously make background
+                # requests and never reach networkidle, causing a guaranteed timeout.
+                # The element-level wait in _fill_and_extract is the real gate.
+                await page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=30_000)
                 return await self._fill_and_extract(page, name, entity_type)
             finally:
                 await browser.close()

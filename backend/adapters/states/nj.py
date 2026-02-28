@@ -2,17 +2,17 @@
 New Jersey Division of Revenue & Enterprise Services — Entity Name Search Adapter
 URL: https://www.njportal.com/DOR/BusinessNameSearch/Search/BusinessName
 
-Uses sync_playwright in a ThreadPoolExecutor (same pattern as Delaware adapter)
-to avoid asyncio subprocess limitations.
+Uses async_playwright directly in the async event loop — no ThreadPoolExecutor needed.
+This avoids the Windows "Racing with another loop to spawn a process" RuntimeError
+that occurs when sync_playwright tries to spawn a subprocess from inside a thread
+that shares asyncio state with the main event loop.
 
 NJ returns: Business Name, Entity ID, Business Type, Status, Date Incorporated.
 The search is prefix-based — returns all entities starting with the entered name.
 """
 import asyncio
-import sys
-from concurrent.futures import ThreadPoolExecutor
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 from adapters.base import AdapterResult, BaseStateAdapter, EntityMatch
 
@@ -44,19 +44,16 @@ NO_RESULTS_TEXT = [
     "no businesses", "0 results", "0 records",
 ]
 
-_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="playwright-nj")
-
 
 class NewJerseyAdapter(BaseStateAdapter):
     state_code = "NJ"
     state_name = "New Jersey"
 
     async def search(self, name: str, entity_type: str) -> AdapterResult:
-        """Async entry point — runs the sync Playwright search in a thread."""
-        loop = asyncio.get_event_loop()
+        """Async entry point — runs async_playwright directly in the event loop."""
         try:
             return await asyncio.wait_for(
-                loop.run_in_executor(_executor, self._search_sync, name, entity_type),
+                self._run(name, entity_type),
                 timeout=90,
             )
         except asyncio.TimeoutError:
@@ -77,35 +74,33 @@ class NewJerseyAdapter(BaseStateAdapter):
             )
 
     # ------------------------------------------------------------------
-    # Synchronous — runs inside ThreadPoolExecutor
+    # Async helpers
     # ------------------------------------------------------------------
 
-    def _search_sync(self, name: str, entity_type: str) -> AdapterResult:
-        if sys.platform == "win32":
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            context = browser.new_context(
+    async def _run(self, name: str, entity_type: str) -> AdapterResult:
+        """Launch browser, navigate to search page, and return results."""
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            context = await browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/120.0.0.0 Safari/537.36"
                 )
             )
-            page = context.new_page()
+            page = await context.new_page()
             try:
-                page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=30_000)
-                return self._fill_and_extract(page, name, entity_type)
+                await page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=30_000)
+                return await self._fill_and_extract(page, name, entity_type)
             finally:
-                browser.close()
+                await browser.close()
 
-    def _fill_and_extract(self, page, name: str, entity_type: str) -> AdapterResult:
+    async def _fill_and_extract(self, page, name: str, entity_type: str) -> AdapterResult:
         # Find the name input field
         input_sel = None
         for sel in NAME_INPUT_SELECTORS:
             try:
-                page.wait_for_selector(sel, timeout=8_000)
+                await page.wait_for_selector(sel, timeout=8_000)
                 input_sel = sel
                 break
             except PWTimeout:
@@ -121,13 +116,13 @@ class NewJerseyAdapter(BaseStateAdapter):
                 extraction_method="failed",
             )
 
-        page.fill(input_sel, name.strip())
+        await page.fill(input_sel, name.strip())
 
         # Click submit
         submitted = False
         for sel in SUBMIT_SELECTORS:
             try:
-                page.click(sel, timeout=5_000)
+                await page.click(sel, timeout=5_000)
                 submitted = True
                 break
             except Exception:
@@ -145,14 +140,14 @@ class NewJerseyAdapter(BaseStateAdapter):
 
         # Wait for results to load
         try:
-            page.wait_for_load_state("networkidle", timeout=20_000)
+            await page.wait_for_load_state("networkidle", timeout=20_000)
         except PWTimeout:
             pass  # parse whatever loaded
 
-        return self._parse_results(page, name, entity_type)
+        return await self._parse_results(page, name, entity_type)
 
-    def _parse_results(self, page, name: str, entity_type: str) -> AdapterResult:
-        page_text = page.inner_text("body").lower()
+    async def _parse_results(self, page, name: str, entity_type: str) -> AdapterResult:
+        page_text = (await page.inner_text("body")).lower()
 
         if any(phrase in page_text for phrase in NO_RESULTS_TEXT):
             return AdapterResult(
@@ -163,14 +158,14 @@ class NewJerseyAdapter(BaseStateAdapter):
                 notes="No matching entities found in New Jersey registry.",
             )
 
-        matches = self._parse_table(page)
+        matches = await self._parse_table(page)
         if not matches:
             # No table found but no explicit "no results" either — use LLM fallback
-            return self._llm_fallback(page_text, name, entity_type)
+            return await self._llm_fallback(page_text, name, entity_type)
 
         return self._classify(matches, name)
 
-    def _parse_table(self, page) -> list[EntityMatch]:
+    async def _parse_table(self, page) -> list[EntityMatch]:
         """
         Parse NJ results table.
         Expected columns: Business Name | Entity ID | Business Type | Status | Date
@@ -180,32 +175,36 @@ class NewJerseyAdapter(BaseStateAdapter):
 
         for table_sel in RESULTS_TABLE_SELECTORS:
             try:
-                if page.locator(table_sel).count() == 0:
+                if await page.locator(table_sel).count() == 0:
                     continue
-                rows = page.locator(f"{table_sel} tr").all()
+                rows = await page.locator(f"{table_sel} tr").all()
                 if len(rows) < 2:
                     continue  # header only — no data rows
 
                 # Detect column positions from header row
-                header_cells = [
-                    c.inner_text().strip().lower()
-                    for c in rows[0].locator("th, td").all()
-                ]
-                col = _col_index(header_cells)
+                header_loc = rows[0].locator("th, td")
+                n_headers = await header_loc.count()
+                header_texts = []
+                for i in range(n_headers):
+                    text = await header_loc.nth(i).inner_text()
+                    header_texts.append(text.strip().lower())
+                col = _col_index(header_texts)
 
                 for row in rows[1:]:
-                    cells = row.locator("td").all()
-                    if not cells:
+                    cells_loc = row.locator("td")
+                    cell_count = await cells_loc.count()
+                    if cell_count == 0:
                         continue
-                    entity_name = _cell(cells, col.get("name", 0))
+                    cells = [cells_loc.nth(i) for i in range(cell_count)]
+                    entity_name = await _cell(cells, col.get("name", 0))
                     if not entity_name:
                         continue
                     matches.append(EntityMatch(
                         name=entity_name,
-                        entity_type=_cell(cells, col.get("type", -1)),
-                        status=_cell(cells, col.get("status", -1)) or "unknown",
-                        file_number=_cell(cells, col.get("id", -1)),
-                        registered=_cell(cells, col.get("date", -1)),
+                        entity_type=await _cell(cells, col.get("type", -1)),
+                        status=await _cell(cells, col.get("status", -1)) or "unknown",
+                        file_number=await _cell(cells, col.get("id", -1)),
+                        registered=await _cell(cells, col.get("date", -1)),
                     ))
                 if matches:
                     break  # found a working table
@@ -240,10 +239,10 @@ class NewJerseyAdapter(BaseStateAdapter):
             notes=f"{len(matches)} similar name(s) found in NJ registry. No exact match.",
         )
 
-    def _llm_fallback(self, page_text: str, name: str, entity_type: str) -> AdapterResult:
-        from llm.client import interpret_state_page_sync
+    async def _llm_fallback(self, page_text: str, name: str, entity_type: str) -> AdapterResult:
+        from llm.client import interpret_state_page
 
-        interpretation = interpret_state_page_sync(
+        interpretation = await interpret_state_page(
             state_name=self.state_name,
             search_name=name,
             entity_type=entity_type,
@@ -281,11 +280,12 @@ def _col_index(headers: list[str]) -> dict[str, int]:
     return mapping
 
 
-def _cell(cells, index: int) -> str:
+async def _cell(cells: list, index: int) -> str:
     """Safely get text from a cell by index."""
     if index < 0 or index >= len(cells):
         return ""
     try:
-        return cells[index].inner_text().strip()
+        text = await cells[index].inner_text()
+        return text.strip()
     except Exception:
         return ""

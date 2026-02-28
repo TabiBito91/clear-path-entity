@@ -1,0 +1,954 @@
+================================================================================
+  CLEAR PATH ENTITY — CODEBASE GUIDE
+  Last updated: 2026-02-28
+================================================================================
+
+PURPOSE
+-------
+Clear Path Entity is an AI-powered web application that checks whether a proposed
+business name is available for registration across multiple U.S. states and checks
+for conflicting federal trademarks with the USPTO. Users enter a name and entity
+type (e.g., "Amova" + "LLC") and receive real-time availability results from each
+state registry, ranked by confidence.
+
+--------------------------------------------------------------------------------
+  DIRECTORY OVERVIEW
+--------------------------------------------------------------------------------
+
+  Clear Path Entity/
+  ├── backend/                  Python (FastAPI) application
+  │   ├── adapters/             Pluggable state search adapters
+  │   │   ├── base.py           Abstract base class all adapters inherit from
+  │   │   ├── states/           One file per U.S. state
+  │   │   │   ├── ca.py         California (REST API)
+  │   │   │   ├── de.py         Delaware (Playwright scraper)
+  │   │   │   ├── nj.py         New Jersey (Playwright scraper)
+  │   │   │   └── ny.py         New York (REST API)
+  │   │   └── detail/
+  │   │       └── opencorporates.py  Entity detail lookup (formation date, agent)
+  │   ├── agents/               Coordination layer
+  │   │   ├── orchestrator.py   Fans out all state + USPTO searches in parallel
+  │   │   └── uspto.py          Federal trademark search (stub, pending WAF bypass)
+  │   ├── llm/
+  │   │   └── client.py         Anthropic Claude integration (Haiku + Sonnet)
+  │   ├── rules/
+  │   │   └── engine.py         Deterministic naming rule validator
+  │   ├── config.py             Environment variable settings
+  │   ├── database.py           SQLAlchemy async database setup
+  │   ├── models.py             ORM table definitions
+  │   ├── main.py               FastAPI app — all HTTP endpoints
+  │   ├── run.py                Windows event loop fix, starts uvicorn
+  │   ├── requirements.txt      Python dependencies
+  │   └── Dockerfile            Container definition
+  ├── frontend/                 Next.js 14+ (App Router) application
+  │   ├── app/
+  │   │   ├── layout.tsx        Root HTML layout (fonts, Tailwind)
+  │   │   ├── page.tsx          Home page — search entry form
+  │   │   └── results/[jobId]/
+  │   │       └── page.tsx      Results page — live-streaming state cards
+  │   ├── components/ui/        shadcn/ui component library
+  │   │   ├── badge.tsx
+  │   │   ├── button.tsx
+  │   │   ├── card.tsx
+  │   │   ├── input.tsx
+  │   │   ├── label.tsx
+  │   │   └── select.tsx
+  │   ├── lib/
+  │   │   ├── api.ts            Type-safe API call functions
+  │   │   └── types.ts          Shared TypeScript interfaces
+  │   ├── package.json
+  │   ├── tsconfig.json
+  │   └── next.config.ts
+  ├── errors/                   Screenshot archive of bugs encountered
+  ├── .env                      Local secrets (git-ignored)
+  ├── .env.example              Template showing required env vars
+  ├── .gitignore
+  └── Learning.txt              This file
+
+--------------------------------------------------------------------------------
+  HOW A SEARCH WORKS (END-TO-END FLOW)
+--------------------------------------------------------------------------------
+
+  1. User fills the form on the frontend (page.tsx) with a business name and
+     entity type, then clicks Search.
+
+  2. Frontend calls POST /api/search (api.ts → main.py:create_search).
+     The backend creates a Job row in the database and returns a job_id.
+
+  3. Frontend immediately redirects to /results/[jobId] and opens an
+     EventSource connection to GET /api/jobs/{jobId}/stream.
+
+  4. Backend spawns a background task (_run_and_signal in main.py) that calls
+     the orchestrator (orchestrator.py:run_search).
+
+  5. The orchestrator fans out searches to all requested state adapters AND
+     the USPTO agent simultaneously using asyncio.gather.
+
+  6. Each state adapter independently:
+       a. Queries the state registry (via API or Playwright browser scraping)
+       b. Parses the results into structured EntityMatch objects
+       c. Falls back to Haiku LLM if deterministic parsing fails
+       d. Returns an AdapterResult (availability, confidence, matched names)
+
+  7. The orchestrator then:
+       a. Runs deterministic naming rules (rules/engine.py) against the result
+       b. If similar names were found, calls Sonnet LLM for deceptive similarity
+          analysis
+       c. Saves a StateResult row to the database
+
+  8. Meanwhile, the SSE endpoint (main.py:stream_results) polls the database
+     every ~1 second and pushes any new StateResult rows to the frontend as
+     "state_result" events.
+
+  9. The frontend (results/[jobId]/page.tsx) receives each event and renders a
+     new StateCard in real time — results appear one by one as states finish.
+
+  10. When all searches are done, the backend emits a "done" event and sets the
+      job status to "complete".
+
+  11. Users can click any result row to fetch entity detail (formation date,
+      entity kind, registered agent) on demand via GET /api/entity/{state}/{id},
+      which hits the OpenCorporates API and caches the response.
+
+--------------------------------------------------------------------------------
+  BACKEND FILES
+--------------------------------------------------------------------------------
+
+========================================
+  backend/config.py
+========================================
+  PURPOSE: Loads all configuration from environment variables into a single
+  typed Settings object. Any file that needs a secret or URL imports `settings`
+  from here instead of reading os.environ directly.
+
+  CLASS Settings(pydantic_settings.BaseSettings)
+    Reads from .env file automatically.
+    Fields:
+      anthropic_api_key  — Required. Used by llm/client.py to call Claude.
+      database_url       — Database connection string. Defaults to SQLite
+                           (sqlite+aiosqlite:///./clearpath.db) for local dev;
+                           swap for postgresql+asyncpg://... in production.
+      frontend_url       — Used for CORS origin allowlist.
+      ca_sos_api_key     — Required only for California adapter.
+
+  MODULE-LEVEL:
+    settings  — Singleton instance imported by all other modules that need config.
+
+  RELATIONSHIPS:
+    Imported by: main.py, llm/client.py, adapters/states/ca.py
+
+========================================
+  backend/models.py
+========================================
+  PURPOSE: Defines the database schema using SQLAlchemy ORM. Every row of
+  persistent data the application stores corresponds to one of these classes.
+
+  FUNCTION utcnow()
+    Returns the current UTC datetime. Used as the default value for timestamp
+    columns so they are always timezone-aware.
+
+  CLASS Job
+    One row per user search request.
+    Columns: id (UUID), name (the searched business name), entity_type (LLC etc.),
+             states (JSON list of state codes queued), status (pending/running/
+             complete/error), created_at, completed_at.
+
+  CLASS StateResult
+    One row per state per job — the outcome of a single state adapter run.
+    Columns: id (UUID), job_id (FK → Job), state_code, state_name,
+             availability (available/taken/similar/unknown/error),
+             confidence (0.0–1.0 float), similar_names (JSON list),
+             flags (JSON list of rule violation messages),
+             raw_matches (JSON list of matched entity dicts), notes (text).
+
+  CLASS UsptoResult
+    One row per job for the USPTO trademark check.
+    Columns: id (UUID), job_id (FK → Job), exact_matches (JSON),
+             similar_marks (JSON), risk_level (low/medium/high/unknown),
+             notes (text).
+
+  CLASS EntityDetailCache
+    Cache table for OpenCorporates lookups. Keyed by "{STATE}:{file_number}".
+    Columns: file_number (PK, composite key string), state_code, entity_name,
+             entity_kind, formation_date, registered_agent.
+    Avoids redundant API calls for the same entity.
+
+  RELATIONSHIPS:
+    Imported by: main.py, agents/orchestrator.py, agents/uspto.py, database.py
+
+========================================
+  backend/database.py
+========================================
+  PURPOSE: Sets up the SQLAlchemy async database engine and provides session
+  factories used throughout the application.
+
+  CLASS Base(DeclarativeBase)
+    SQLAlchemy base class. All ORM model classes in models.py inherit from this.
+    Its metadata is used by init_db() to create all tables.
+
+  MODULE-LEVEL:
+    engine             — Async SQLAlchemy engine created from settings.database_url.
+    AsyncSessionLocal  — An async_sessionmaker used to create sessions manually
+                         (e.g., inside background tasks that don't have FastAPI's
+                         dependency injection available).
+
+  FUNCTION get_db()
+    FastAPI dependency. Yields an AsyncSession for use inside request handlers.
+    Sessions are automatically closed when the request finishes. Used with
+    `db: AsyncSession = Depends(get_db)` in endpoint function signatures.
+
+  FUNCTION init_db()
+    Called once at application startup (in main.py's lifespan handler).
+    Runs Base.metadata.create_all() to create any missing tables.
+
+  RELATIONSHIPS:
+    Imported by: main.py, agents/orchestrator.py, agents/uspto.py
+
+========================================
+  backend/main.py
+========================================
+  PURPOSE: The FastAPI application. Defines all HTTP endpoints and coordinates
+  the background search execution with the SSE streaming layer.
+
+  MODULE-LEVEL:
+    app              — The FastAPI application instance.
+    _active_jobs     — In-memory dict mapping job_id → asyncio.Event. The event
+                       is set when a background search finishes, allowing the SSE
+                       generator to wake up immediately instead of waiting for the
+                       next 1-second poll.
+    SUPPORTED_STATES — List of state codes that have adapters: ["CA","DE","NJ","NY"]
+    ENTITY_TYPES     — Valid entity types: ["LLC","Corporation","LP","LLP","PC","PLLC"]
+
+  CLASS SearchRequest(BaseModel)
+    Pydantic request schema for POST /api/search.
+    Fields: name (str), entity_type (str), states (optional list of state codes).
+    If states is omitted, all SUPPORTED_STATES are used.
+
+  CLASS SearchResponse(BaseModel)
+    Response schema for POST /api/search.
+    Fields: job_id (str), states_queued (list of state codes actually searched).
+
+  FUNCTION lifespan(app)
+    FastAPI lifespan context manager. Calls init_db() so tables are created
+    before the first request arrives.
+
+  ENDPOINT create_search()  [POST /api/search]
+    1. Validates the name and entity_type.
+    2. Filters requested states to only supported ones.
+    3. Creates a Job row in the database.
+    4. Creates an asyncio.Event and stores it in _active_jobs.
+    5. Schedules _run_and_signal as a FastAPI background task.
+    6. Returns the job_id immediately so the frontend can start streaming.
+
+  FUNCTION _run_and_signal(job_id, name, entity_type, states, done_event)
+    The actual background task. Marks the job as "running", calls
+    orchestrator.run_search(), then marks it "complete" or "error".
+    Always calls done_event.set() so the SSE generator can wake up.
+
+  ENDPOINT stream_results()  [GET /api/jobs/{job_id}/stream]
+    Returns an EventSourceResponse (Server-Sent Events).
+    Inner generator event_generator():
+      - Polls the database for new StateResult and UsptoResult rows.
+      - Yields each unseen result as a "state_result" or "uspto_result" event.
+      - Sleeps 1 second between polls, but wakes early if done_event fires.
+      - Yields "done" event and returns when job is complete or errored.
+
+  ENDPOINT get_job()  [GET /api/jobs/{job_id}]
+    Returns a full snapshot of a job: metadata plus all state and USPTO results.
+    Used by the frontend on page load to get the search name for display.
+
+  ENDPOINT get_entity_detail()  [GET /api/entity/{state_code}/{file_number}]
+    Checks the EntityDetailCache table first. On a miss, calls
+    opencorporates.fetch_entity_detail(), caches the result, and returns it.
+    Provides formation date, entity kind, and registered agent for any matched
+    entity when the user expands a result row.
+
+  RELATIONSHIPS:
+    Imports: orchestrator.run_search, opencorporates.fetch_entity_detail,
+             models (Job, StateResult, UsptoResult, EntityDetailCache),
+             database (get_db, AsyncSessionLocal, init_db), config.settings
+
+========================================
+  backend/adapters/base.py
+========================================
+  PURPOSE: Defines the contract that every state adapter must fulfill.
+  All adapter classes inherit from BaseStateAdapter and return AdapterResult.
+
+  CLASS EntityMatch(dataclass)
+    Represents a single entity found in a state registry search.
+    Fields: name (str), entity_type (str), status (str, e.g. "Active"),
+            file_number (str), registered (str, formation date if available).
+
+  CLASS AdapterResult(dataclass)
+    Structured output from any state adapter search.
+    Fields:
+      state_code        — Two-letter state abbreviation (e.g., "NJ")
+      state_name        — Full state name (e.g., "New Jersey")
+      availability      — One of: "available", "taken", "similar", "unknown", "error"
+      confidence        — Float 0.0–1.0 computed by _build_confidence()
+      raw_matches       — List of EntityMatch or dict for exact/partial matches found
+      similar_names     — List of name strings for similar (non-exact) hits
+      flags             — List of rule violation message strings
+      notes             — Human-readable summary of the result
+      extraction_method — "primary", "fallback", "llm", or "failed"
+      source_type       — "api", "web_form", or "llm"
+
+  CLASS BaseStateAdapter (ABC)
+    Abstract base class. All state adapters extend this.
+
+    ABSTRACT METHOD search(name, entity_type) -> AdapterResult
+      Must be implemented by each state subclass. The orchestrator calls this.
+
+    METHOD _build_confidence(extraction_method, clarity) -> float
+      Computes the confidence score using the formula:
+        Confidence = (extraction_quality × 0.40)
+                   + (source_reliability   × 0.25)
+                   + (result_clarity       × 0.25)
+                   + (recency              × 0.10)
+
+      extraction_method lookup:
+        "primary"  → 1.00  (deterministic parse of structured data)
+        "fallback" → 0.70  (secondary selector or partial parse)
+        "llm"      → 0.40  (LLM interpreted unstructured text)
+        "failed"   → 0.10  (could not extract)
+
+      clarity lookup:
+        "clear"    → 1.00  (unambiguous result)
+        "inferred" → 0.70  (result inferred from context)
+        "ambiguous"→ 0.40  (uncertain outcome)
+
+  RELATIONSHIPS:
+    Imported by: all state adapters in adapters/states/,
+                 orchestrator.py (via adapter instances)
+
+========================================
+  backend/adapters/states/ca.py
+========================================
+  PURPOSE: Searches the California Secretary of State Business Entity database
+  using their APIM REST API. No browser automation needed — pure HTTP.
+
+  CLASS CaliforniaAdapter(BaseStateAdapter)
+    state_code = "CA", state_name = "California"
+
+    METHOD search(name, entity_type) -> AdapterResult
+      Checks that CA_SOS_API_KEY is configured, then calls the CA SOS
+      Business Entity Keyword Search endpoint via httpx async HTTP client.
+      Requests up to 150 entities matching the name (all statuses).
+      Returns error result if key is missing, on timeout, or HTTP error.
+
+    METHOD _classify(matches, search_name) -> AdapterResult
+      Separates exact matches from similar matches. Exact match → "taken"
+      (with a note if all matching entities are inactive/dissolved).
+      Similar only → "similar". No matches → "available".
+
+  HELPER FUNCTION _get(entity_dict, *keys) -> str
+    Tries multiple field name variants (PascalCase and camelCase) against
+    the entity dict returned by the API, since the field naming is inconsistent.
+    Returns the first non-empty value found, or empty string.
+
+  HELPER FUNCTION _parse_results(data) -> list[EntityMatch]
+    Extracts the list of entity dicts from the raw API JSON response,
+    handling both Azure APIM wrapper format and direct API format.
+
+  RELATIONSHIPS:
+    Imports: adapters/base, config.settings, httpx
+
+========================================
+  backend/adapters/states/de.py
+========================================
+  PURPOSE: Scrapes the Delaware Division of Corporations ICIS web form using
+  Playwright (headless Chromium). Uses sync_playwright in a ThreadPoolExecutor
+  because of Windows asyncio subprocess limitations that existed at the time
+  of writing. (NJ was later refactored to avoid this pattern — see nj.py.)
+
+  CLASS DelawareAdapter(BaseStateAdapter)
+    state_code = "DE", state_name = "Delaware"
+
+    METHOD search(name, entity_type) -> AdapterResult
+      Async entry point. Runs _search_sync in the module-level ThreadPoolExecutor
+      using asyncio.run_in_executor, with a 90-second overall timeout.
+
+    METHOD _search_sync(name, entity_type) -> AdapterResult
+      Runs inside a thread. Sets WindowsProactorEventLoopPolicy for the thread,
+      then launches headless Chromium with sync_playwright, navigates to the
+      ICIS search form, and calls _fill_and_extract.
+
+    METHOD _fill_and_extract(page, name, entity_type) -> AdapterResult
+      Tries a list of candidate CSS selectors to find the name input field.
+      Fills it, clicks Submit, waits for the results to load, then parses.
+
+    METHOD _parse_results(page, name, entity_type) -> AdapterResult
+      Checks for a "no results" message in the page text. If found → "available".
+      Otherwise tries to parse the results table. Falls back to LLM if needed.
+
+    METHOD _parse_table_rows(page) -> list[EntityMatch]
+      Reads the #tblResults table, extracts FILE NUMBER and ENTITY NAME columns.
+
+    METHOD _classify(matches, search_name) -> AdapterResult
+      Same logic as other adapters: exact match → "taken", partial → "similar",
+      none → "available".
+
+    METHOD _llm_fallback(page_text, name, entity_type) -> AdapterResult
+      Calls interpret_state_page_sync (sync Haiku) when table parsing fails.
+      Returns LLM-interpreted availability with lower confidence.
+
+  MODULE-LEVEL:
+    _executor  — ThreadPoolExecutor(max_workers=3) shared across DE adapter calls.
+
+  RELATIONSHIPS:
+    Imports: adapters/base, llm/client (sync version), playwright.sync_api
+
+========================================
+  backend/adapters/states/nj.py
+========================================
+  PURPOSE: Scrapes the New Jersey Division of Revenue & Enterprise Services
+  business name search portal using async_playwright directly in the async event
+  loop. This is the preferred pattern — no ThreadPoolExecutor needed — and avoids
+  the "Racing with another loop to spawn a process" RuntimeError that was caused
+  by sync_playwright's internal subprocess management conflicting with the main
+  asyncio loop on Windows.
+
+  CLASS NewJerseyAdapter(BaseStateAdapter)
+    state_code = "NJ", state_name = "New Jersey"
+
+    METHOD search(name, entity_type) -> AdapterResult
+      Async entry point. Wraps _run() in asyncio.wait_for with a 90-second
+      global timeout. Catches TimeoutError and generic exceptions, returning
+      an error AdapterResult in both cases.
+
+    METHOD _run(name, entity_type) -> AdapterResult
+      Opens async_playwright context, launches headless Chromium, creates a
+      browser context with a realistic User-Agent header, opens a new page,
+      navigates to the NJ search URL, and delegates to _fill_and_extract.
+      Always closes the browser in a finally block.
+
+    METHOD _fill_and_extract(page, name, entity_type) -> AdapterResult
+      Tries each selector in NAME_INPUT_SELECTORS until one appears on the page.
+      Fills the found input with the search name. Then tries each selector in
+      SUBMIT_SELECTORS until a click succeeds. Waits for the page to reach
+      "networkidle" state (or continues after 20s if it doesn't). Calls
+      _parse_results.
+
+    METHOD _parse_results(page, name, entity_type) -> AdapterResult
+      Reads the full body text. If any NO_RESULTS_TEXT phrase is present,
+      returns "available". Otherwise calls _parse_table. If _parse_table
+      returns nothing, falls back to _llm_fallback.
+
+    METHOD _parse_table(page) -> list[EntityMatch]
+      Iterates RESULTS_TABLE_SELECTORS until a table with at least 2 rows is
+      found. Reads the header row to detect column positions dynamically (the
+      NJ portal header names can shift). Then reads each data row and extracts
+      name, entity type, status, file number, and date. Stops on the first
+      selector that yields matches.
+
+    METHOD _classify(matches, search_name) -> AdapterResult
+      Separates exact and similar matches, returns appropriate AdapterResult.
+
+    METHOD _llm_fallback(page_text, name, entity_type) -> AdapterResult
+      Calls the async interpret_state_page (Haiku) when table parsing fails.
+      Returns LLM-interpreted result with reduced confidence.
+
+  HELPER FUNCTION _col_index(headers) -> dict
+    Takes a list of lowercase header cell strings and returns a dict mapping
+    semantic keys ("name", "id", "type", "status", "date") to column indices.
+    Used to handle column reordering between portal versions.
+
+  ASYNC HELPER FUNCTION _cell(cells, index) -> str
+    Safely awaits inner_text() on the cell Locator at the given index.
+    Returns empty string if the index is out of range or the call fails.
+
+  WHY THIS FILE CHANGED FROM de.py PATTERN:
+    Delaware uses sync_playwright + ThreadPoolExecutor because it was written
+    first and that pattern was the established workaround. NJ originally used
+    the same pattern but hit "Racing with another loop to spawn a process"
+    because Windows asyncio's subprocess transport is not safe to call from
+    multiple threads that share event loop state. Using async_playwright with
+    asyncio.wait_for eliminates the threading layer entirely.
+
+  RELATIONSHIPS:
+    Imports: adapters/base, llm/client (async version), playwright.async_api
+
+========================================
+  backend/adapters/states/ny.py
+========================================
+  PURPOSE: Searches the New York entity registry using the NY Open Data SODA
+  REST API. No browser automation needed. The dataset ("Active Corporations:
+  Beginning 1800") is publicly queryable without authentication.
+
+  CLASS NewYorkAdapter(BaseStateAdapter)
+    state_code = "NY", state_name = "New York"
+
+    METHOD search(name, entity_type) -> AdapterResult
+      Runs three sequential SODA API queries via httpx AsyncClient:
+        1. Exact match on the bare name.
+        2. Exact match on the name with the entity type suffix appended
+           (e.g., "AMOVA LLC") because many NY registrations include the suffix.
+        3. Similarity query using LIKE '%name%' to find partial matches.
+      Combines results and calls _classify. Uses sequential (not parallel)
+      requests to stay within the API's rate limits.
+
+    METHOD _classify(exact_matches, similar_matches, search_name) -> AdapterResult
+      If any exact match → "taken". If only similar → "similar". None → "available".
+
+  HELPER FUNCTION _esc(s) -> str
+    Escapes single quotes in a string for use in a SODA $where clause.
+
+  HELPER FUNCTION _to_match(row) -> EntityMatch
+    Converts a SODA API row dict to an EntityMatch dataclass.
+
+  HELPER FUNCTION _fetch_two(client, url, params1, params2) -> tuple
+    Runs two sequential SODA queries and returns both result lists. Used
+    for the two exact-match queries to minimize code repetition.
+
+  RELATIONSHIPS:
+    Imports: adapters/base, httpx
+
+========================================
+  backend/adapters/detail/opencorporates.py
+========================================
+  PURPOSE: Fetches enrichment data about a specific registered entity —
+  formation date, entity kind, and registered agent — from the OpenCorporates
+  public API. Called on demand when a user expands a matched result row.
+
+  FUNCTION fetch_entity_detail(state_code, file_number) -> dict
+    Sends an async GET request to the OpenCorporates API for the given
+    state/file_number combination. Parses the response to extract:
+      entity_name     — Official registered name
+      entity_kind     — E.g., "Limited Liability Company"
+      formation_date  — Incorporation date
+      registered_agent — Name of the registered agent (from officers list)
+      opencorporates_url — Direct link to the entity on OpenCorporates
+    Returns a dict with an "error" key on 404, timeout, or HTTP errors.
+    Handles the officers array to find the person/entity with role "agent".
+
+  RELATIONSHIPS:
+    Imported by: main.py (get_entity_detail endpoint), httpx
+
+========================================
+  backend/agents/orchestrator.py
+========================================
+  PURPOSE: The central coordinator. Takes a job's parameters, fans out to
+  all requested state adapters and the USPTO agent simultaneously, applies
+  rules and similarity analysis to each result, and persists everything to
+  the database.
+
+  MODULE-LEVEL:
+    STATE_ADAPTERS  — Dict mapping state code strings to adapter classes.
+                      {"CA": CaliforniaAdapter, "DE": DelawareAdapter,
+                       "NJ": NewJerseyAdapter, "NY": NewYorkAdapter}
+                      To add a new state: import its adapter and add it here.
+
+  FUNCTION run_search(job_id, name, entity_type, states) -> None
+    Main entry point called by main.py's background task.
+    Builds a list of asyncio tasks: one _run_state call per requested state
+    (filtered against STATE_ADAPTERS) plus one search_uspto call.
+    Runs all tasks concurrently with asyncio.gather(return_exceptions=True),
+    so one adapter failing does not cancel others.
+
+  FUNCTION _run_state(job_id, name, entity_type, adapter) -> None
+    Handles a single state's full pipeline:
+      1. Calls adapter.search(name, entity_type) → AdapterResult
+      2. Calls rules.apply_rules(name, entity_type, state_code) → list of flags
+      3. If availability is "similar" and similar names exist, calls
+         llm.analyze_similarity (Sonnet) for deceptive similarity analysis.
+         The risk level and explanation are appended to the flags list.
+      4. Creates a StateResult ORM row and commits it to the database.
+         This commit is what the SSE stream picks up and sends to the frontend.
+
+  RELATIONSHIPS:
+    Imports: all state adapters, agents/uspto, llm/client, rules/engine,
+             database, models
+
+========================================
+  backend/agents/uspto.py
+========================================
+  PURPOSE: Federal trademark availability check against the USPTO TESS system.
+  Currently a stub — the USPTO search portal uses WAF (bot protection) that
+  blocks automated requests as of early 2026.
+
+  FUNCTION search_uspto(job_id, name) -> None
+    Creates a UsptoResult row in the database with:
+      risk_level = "unknown"
+      notes = message explaining the search is unavailable and providing the
+              direct TESS URL the user can visit manually.
+    This result is still streamed to the frontend so the user sees the USPTO
+    card with a manual search link rather than an empty section.
+
+  RELATIONSHIPS:
+    Imports: database, models
+
+========================================
+  backend/llm/client.py
+========================================
+  PURPOSE: Single point of integration with Anthropic's Claude API. Provides
+  two distinct LLM functions used at different points in the pipeline.
+
+  MODULE-LEVEL:
+    _async_client  — AsyncAnthropic instance (used by all async callers)
+    _sync_client   — Anthropic sync instance (used only by DE adapter's thread)
+    HAIKU          — Model ID "claude-haiku-4-5-20251001". Used for cheap,
+                     fast fallback page interpretation (~300 tokens per call).
+    SONNET         — Model ID "claude-sonnet-4-6". Used for nuanced deceptive
+                     similarity analysis (~400 tokens per call).
+
+  FUNCTION interpret_state_page(state_name, search_name, entity_type, page_text)
+    -> dict   [ASYNC]
+    Called when a Playwright adapter's deterministic parsing fails to extract
+    a result (no table found, no clear "no results" message).
+    Sends up to 3,000 characters of raw page text to Haiku with a structured
+    prompt asking it to classify availability and list any similar names.
+    Returns parsed JSON: {availability, similar_names, clarity, notes}.
+    Falls back to safe defaults if JSON parsing fails.
+
+  FUNCTION interpret_state_page_sync(...)  [SYNC]
+    Identical to interpret_state_page but uses _sync_client.
+    Used only by the Delaware adapter, which runs in a ThreadPoolExecutor
+    where awaiting is not possible.
+
+  FUNCTION analyze_similarity(search_name, entity_type, state_name,
+                               similar_names, state_rules_summary) -> dict  [ASYNC]
+    Called by the orchestrator when an adapter returns "similar" results.
+    Sends the list of conflicting names to Sonnet with context about the
+    state's naming rules.
+    Returns parsed JSON: {risk_level, conflicting_names, explanation,
+                          recommendation}.
+    Risk levels: "low", "medium", "high", "unknown".
+    Falls back to "unknown" risk if the response cannot be parsed.
+
+  RELATIONSHIPS:
+    Imports: anthropic, config.settings
+    Imported by: orchestrator.py, adapters/states/de.py, adapters/states/nj.py
+
+========================================
+  backend/rules/engine.py
+========================================
+  PURPOSE: Fast, deterministic validation of a business name against a state's
+  naming rules. Runs before any LLM call so obvious violations are caught at
+  near-zero cost. Returns human-readable flag messages for display in the UI.
+
+  CLASS NamingRule(dataclass)
+    Represents a single naming rule.
+    Fields:
+      pattern      — Compiled regex that triggers the rule if matched
+      message      — Human-readable violation message shown in the UI
+      severity     — "block" (definitely rejected), "warning", or "info"
+      entity_types — List of entity types this rule applies to, or ["ALL"]
+
+  FUNCTION apply_rules(name, entity_type, state_code) -> list[str]
+    Looks up the rules for state_code in the RULES dict.
+    For each rule, checks if the entity_type matches and if the regex matches
+    the name. Collects all matching rule messages and returns them as a list.
+    An empty list means no violations found.
+
+  FUNCTION get_rules_summary(state_code) -> str
+    Returns a pre-written plain-text summary of a state's naming rules,
+    used as context in the Sonnet similarity analysis prompt so the LLM
+    understands what is and isn't allowed.
+
+  MODULE-LEVEL:
+    RULES  — Dict mapping state codes to lists of NamingRule objects.
+             Currently defined for DE. Other states can be added here.
+             Example DE rules:
+               - Restricted words: bank, trust, insurance, university, etc.
+               - Suffix mismatch: using "Inc." in an LLC name
+    STATE_RULES_SUMMARIES  — Dict mapping state codes to text summaries for LLM.
+
+  RELATIONSHIPS:
+    Imported by: agents/orchestrator.py
+
+========================================
+  backend/run.py
+========================================
+  PURPOSE: Windows-specific startup script. Must be used instead of running
+  uvicorn directly from the command line on Windows.
+
+  WHAT IT DOES:
+    Sets asyncio.WindowsProactorEventLoopPolicy() BEFORE uvicorn starts.
+    This ensures the main event loop uses the ProactorEventLoop, which
+    supports the subprocess transport that Playwright needs to launch Chromium.
+    On the default WindowsSelectorEventLoopPolicy, Playwright subprocess
+    spawning fails with "NotImplementedError".
+
+  HOW TO USE:
+    python run.py           (instead of uvicorn main:app --reload)
+
+  RELATIONSHIPS:
+    Imports: asyncio, uvicorn, main.app
+
+--------------------------------------------------------------------------------
+  FRONTEND FILES
+--------------------------------------------------------------------------------
+
+========================================
+  frontend/lib/types.ts
+========================================
+  PURPOSE: Shared TypeScript type definitions used across all frontend files.
+  Keeping types in one place ensures the frontend and backend stay in sync.
+
+  TYPE Availability = "available" | "taken" | "similar" | "unknown" | "error"
+    The six possible outcomes of a state search.
+
+  TYPE RiskLevel = "low" | "medium" | "high" | "unknown"
+    Trademark risk levels returned by USPTO or similarity analysis.
+
+  INTERFACE StateResult
+    Shape of a single state result as received from the SSE stream.
+    Fields: state_code, state_name, availability, confidence (0–1),
+            similar_names (string[]), flags (string[]),
+            raw_matches (object[]), notes (string).
+
+  INTERFACE UsptoResult
+    Shape of the federal trademark result.
+    Fields: exact_matches (TrademarkMark[]), similar_marks (TrademarkMark[]),
+            risk_level, notes.
+
+  INTERFACE TrademarkMark
+    A single trademark registration.
+    Fields: mark, status, serial_number, owner, nice_classes (string[]), live (bool).
+
+  INTERFACE EntityDetail
+    On-demand entity enrichment from OpenCorporates.
+    Fields: file_number, entity_name, entity_kind, formation_date,
+            registered_agent, opencorporates_url, error (optional), cached (bool).
+
+  RELATIONSHIPS:
+    Imported by: frontend/lib/api.ts, frontend/app/results/[jobId]/page.tsx
+
+========================================
+  frontend/lib/api.ts
+========================================
+  PURPOSE: All HTTP communication from the frontend to the backend lives here.
+  Components never call fetch() directly — they use these typed functions.
+
+  FUNCTION createSearch(name, entityType, states?) -> Promise<{job_id, states_queued}>
+    POST /api/search. Sends the search parameters and returns the job ID.
+    Throws on HTTP error (component should catch and display error).
+
+  FUNCTION streamResults(jobId) -> EventSource
+    Returns a native browser EventSource connected to /api/jobs/{jobId}/stream.
+    The caller (results page) adds event listeners for "state_result",
+    "uspto_result", and "done" events.
+
+  FUNCTION fetchEntityDetail(stateCode, fileNumber) -> Promise<EntityDetail>
+    GET /api/entity/{stateCode}/{fileNumber}. Returns enrichment data for
+    a specific matched entity. Called on demand when a user expands a row.
+
+  RELATIONSHIPS:
+    Imports: types.ts
+    Imported by: frontend/app/page.tsx, frontend/app/results/[jobId]/page.tsx
+
+========================================
+  frontend/app/layout.tsx
+========================================
+  PURPOSE: The root Next.js App Router layout. Wraps every page.
+
+  EXPORT metadata
+    SEO metadata object: title and description for the application.
+
+  COMPONENT RootLayout({ children })
+    Renders the <html> and <body> tags with Geist font class and Tailwind's
+    antialiased class. All pages render inside {children}.
+
+========================================
+  frontend/app/page.tsx
+========================================
+  PURPOSE: The home page — the search entry form users see first.
+  A client component ("use client") because it manages form state.
+
+  STATE:
+    name        — The business name typed by the user.
+    entityType  — Selected entity type (default "LLC").
+    loading     — True while awaiting the POST /api/search response.
+    error       — Error message string if the request fails.
+
+  FUNCTION handleSubmit(e)
+    Prevents form default behavior, calls api.createSearch(), and on success
+    uses Next.js router.push() to navigate to /results/[jobId].
+    Sets error state if the API call fails.
+
+  RENDER:
+    A centered card with:
+      - Text input bound to `name`
+      - Select dropdown bound to `entityType` (shadcn/ui Select)
+      - Submit button (disabled + shows spinner while loading)
+      - Error message if present
+      - Disclaimer: "Results are availability indicators only — not legal advice."
+
+========================================
+  frontend/app/results/[jobId]/page.tsx
+========================================
+  PURPOSE: The real-time results page. Opens an SSE connection and renders
+  state result cards as they stream in from the backend.
+  A client component ("use client").
+
+  STATE:
+    stateResults  — Growing array of StateResult objects received via SSE.
+    usptoResult   — UsptoResult once it arrives via SSE.
+    status        — "running" | "complete" | "error"
+    searchName    — The business name being searched (fetched from GET /api/jobs).
+
+  useEffect (on mount)
+    1. Calls GET /api/jobs/{jobId} to get the search name for the header.
+    2. Opens an EventSource via api.streamResults(jobId).
+    3. Handles "state_result" events: parses JSON, appends to stateResults.
+    4. Handles "uspto_result" events: parses JSON, sets usptoResult.
+    5. Handles "done" events: sets status to "complete" or "error", closes stream.
+    6. Cleanup: closes the EventSource when the component unmounts.
+
+  SUB-COMPONENT AvailabilityIcon({ status })
+    Returns a colored icon: green check (available), red X (taken),
+    yellow triangle (similar), grey question mark (unknown/error).
+
+  SUB-COMPONENT AvailabilityBadge({ status })
+    Returns a color-coded text badge for the availability status.
+
+  SUB-COMPONENT ConfidencePill({ value })
+    Displays the confidence as "High (89%)", "Medium (65%)", or "Low (30%)"
+    with corresponding color. Thresholds: >0.75 high, >0.50 medium, else low.
+
+  SUB-COMPONENT RiskBadge({ level })
+    Displays the trademark risk level with color coding.
+
+  SUB-COMPONENT MatchRow({ match, stateCode })
+    A single row for a matched entity within a StateCard.
+    On click, fetches entity detail from api.fetchEntityDetail() and expands
+    to show formation_date, entity_kind, registered_agent, and a link to
+    OpenCorporates. Shows a spinner while loading detail.
+
+  SUB-COMPONENT StateCard({ result })
+    Full card for one state's result. Shows state name, availability icon,
+    badge, confidence pill, notes, any flags (rule violations and similarity
+    analysis), and a collapsible list of MatchRow components.
+
+  SUB-COMPONENT UsptoCard({ result })
+    Card for the USPTO trademark result. Shows risk badge, notes, and
+    expandable lists of exact trademark matches and similar marks.
+
+  RENDER:
+    Header: search name in quotes, entity type, summary bar counting
+            available/taken/similar results, and a "Complete"/"Running" badge.
+    Body: UsptoCard (if available), then a StateCard for each result in order
+          of arrival. Footer disclaimer.
+
+========================================
+  frontend/components/ui/
+========================================
+  PURPOSE: shadcn/ui component library — pre-built, accessible React components
+  styled with Tailwind CSS. Generated via the shadcn CLI; do not edit manually.
+
+  badge.tsx   — <Badge> — small status label. Variants: default, secondary,
+                destructive, outline.
+  button.tsx  — <Button> — clickable button with variants and sizes.
+  card.tsx    — <Card>, <CardHeader>, <CardTitle>, <CardContent> — container.
+  input.tsx   — <Input> — styled text input wrapping <input>.
+  label.tsx   — <Label> — form label wrapping Radix UI Label.
+  select.tsx  — <Select>, <SelectTrigger>, <SelectValue>, <SelectContent>,
+                <SelectItem> — accessible dropdown wrapping Radix UI Select.
+
+  RELATIONSHIPS:
+    Imported by: frontend/app/page.tsx, frontend/app/results/[jobId]/page.tsx
+
+--------------------------------------------------------------------------------
+  KEY DESIGN PATTERNS
+--------------------------------------------------------------------------------
+
+  1. ADAPTER REGISTRY PATTERN
+     Each state is a self-contained class (adapter). The orchestrator's
+     STATE_ADAPTERS dict maps state codes to adapter classes. Adding support
+     for a new state means: (a) create a new file in adapters/states/,
+     (b) add one line to orchestrator.STATE_ADAPTERS, (c) add the code to
+     SUPPORTED_STATES in main.py. No other files need to change.
+
+  2. EXTRACT FIRST, INTERPRET SECOND
+     Deterministic code (regex, DOM parsing, table reading) handles the
+     common case. The Haiku LLM is called only when deterministic extraction
+     fails. This keeps LLM token costs low (~60-70% reduction vs. always
+     using LLM) while maintaining a fallback for edge cases.
+
+  3. CONFIDENCE SCORING
+     Every result carries a numeric confidence score (0.0–1.0) computed from
+     four factors: extraction quality, source reliability, result clarity, and
+     recency. This surfaces uncertainty to the user rather than hiding it.
+     A result from a REST API with clear "not found" is 0.85+; an LLM-
+     interpreted result from a scraped page is ~0.30.
+
+  4. SSE STREAMING
+     Results are pushed to the frontend as they arrive, not batched at the
+     end. Each state adapter runs independently; fast API-based states (NY, CA)
+     resolve in seconds while Playwright-based states (NJ, DE) may take 20–40s.
+     The user sees results progressively rather than waiting for the slowest
+     state.
+
+  5. RULE-THEN-LLM PIPELINE
+     Naming rule validation always runs before similarity LLM analysis.
+     Rules are regex-based and free. LLM is only called when there are actual
+     similar name hits that require nuanced judgment.
+
+  6. ASYNC THROUGHOUT
+     The backend is fully async (FastAPI + SQLAlchemy async + httpx async +
+     async_playwright). The only sync code is Delaware's Playwright scraper,
+     which is isolated in a ThreadPoolExecutor. All other adapters use native
+     async/await without threading.
+
+--------------------------------------------------------------------------------
+  ENVIRONMENT VARIABLES
+--------------------------------------------------------------------------------
+
+  Required:
+    ANTHROPIC_API_KEY   — Anthropic API key for Claude (Haiku + Sonnet)
+
+  Optional:
+    DATABASE_URL        — Default: sqlite+aiosqlite:///./clearpath.db
+                          Production: postgresql+asyncpg://user:pw@host:5432/db
+    FRONTEND_URL        — Default: http://localhost:3000 (used for CORS)
+    CA_SOS_API_KEY      — Required only when searching California
+
+--------------------------------------------------------------------------------
+  HOW TO ADD A NEW STATE ADAPTER
+--------------------------------------------------------------------------------
+
+  1. Create backend/adapters/states/xx.py (replace xx with state code).
+     Copy the structure from nj.py (async_playwright) or ny.py (REST API).
+     Implement the search() method returning an AdapterResult.
+
+  2. Add to orchestrator.py:
+       from adapters.states.xx import XxAdapter
+       STATE_ADAPTERS["XX"] = XxAdapter
+
+  3. Add to main.py:
+       SUPPORTED_STATES = [..., "XX"]
+
+  4. Optionally add naming rules to rules/engine.py RULES dict.
+
+  5. Test: python -c "import asyncio; from adapters.states.xx import XxAdapter;
+     print(asyncio.run(XxAdapter().search('TestName', 'LLC')))"
+
+--------------------------------------------------------------------------------
+  DEPENDENCIES SUMMARY
+--------------------------------------------------------------------------------
+
+  BACKEND (Python):
+    fastapi           Web framework + dependency injection
+    uvicorn           ASGI server
+    sqlalchemy        ORM (async engine, async session)
+    aiosqlite         SQLite async driver (development)
+    asyncpg           PostgreSQL async driver (production)
+    playwright        Browser automation (Chromium)
+    anthropic         Claude API client (async + sync)
+    httpx             Async HTTP client (CA, NY, OpenCorporates)
+    pydantic-settings Config/env loading
+    sse-starlette     Server-Sent Events response type
+    python-dotenv     .env file loading
+
+  FRONTEND (Node/TypeScript):
+    next              React framework (App Router)
+    react             UI library
+    lucide-react      Icon library
+    radix-ui          Accessible UI primitives (used by shadcn)
+    tailwindcss       Utility-first CSS
+    clsx              className combining utility
+    tailwind-merge    Merge Tailwind classes without conflicts
+
+================================================================================
+  END OF LEARNING.TXT
+================================================================================

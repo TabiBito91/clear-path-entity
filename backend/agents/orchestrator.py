@@ -7,8 +7,10 @@ import asyncio
 
 from adapters.states.ca import CaliforniaAdapter
 from adapters.states.de import DelawareAdapter
+from adapters.states.fl import FloridaAdapter
 from adapters.states.nj import NewJerseyAdapter
 from adapters.states.ny import NewYorkAdapter
+from adapters.states.wa import WashingtonAdapter
 from agents.uspto import search_uspto
 from database import AsyncSessionLocal
 from llm.client import analyze_similarity
@@ -19,8 +21,10 @@ from rules.engine import apply_rules, get_rules_summary
 STATE_ADAPTERS = {
     "CA": CaliforniaAdapter,
     "DE": DelawareAdapter,
+    "FL": FloridaAdapter,
     "NJ": NewJerseyAdapter,
     "NY": NewYorkAdapter,
+    "WA": WashingtonAdapter,
 }
 
 
